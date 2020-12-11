@@ -7,6 +7,9 @@
 #include <deque>
 #include <thread>
 #include <mutex>
+#include <string_view>
+#include <assert.h>
+#include <cstdio>
 
 #include <fmt/format.h>
 #include <fmt/color.h>
@@ -16,64 +19,17 @@
 
 #include "cxxopts.hpp"
 
-/// Max power for all loops this is equal to rougthly 4 GB
-static constexpr long max_size_power = 33;
-
-/// Size of a kilobyte
-static constexpr long kilobyte = 1024;
-
-/// Size of a megabyte
-static constexpr long megabyte = 1024 * 1024;
-
-/// Size of  gigabyte
-static constexpr long gigabyte = 1024 * 1024 * 1024;
-
-///
-/// options which can be set via command line
-///
- 
-/// Varialbe if you want to print the total time
-static bool print_total_time = false;
- 
-/// Number of times to repeat an allocation test
-static long repeat = 100;
-
-/// Variable if statistic should be printed
-static bool print_statistics = false;
-
-using fsec     = std::chrono::duration<float>;
-using stdclock = std::chrono::steady_clock;
-
-/// Taken fron Chandler Carruth's CppCon 2015 talk "Tuning C++: Benchmarks, and CPUs, and Compilers!
-/// Oh My!" This function is magic! It takes any pointer, and basically turns of the optimizer for
-/// it
-static void escape(void* p)
-{
-    // This inline assemlby tells the compiler, it has some unknowable but observable sideeffect.
-    // And therefore, the compiler is not allowed to look further into it, we know better please
-    // compiler don't do anything with it. The inline assembly code, takes p as an input, and we say
-    // potentially we touched and motified all the memory of the system. It dosen't to anything,
-    // therefore dosen't create any actuall code, but the optimizer can't see through this
-    asm volatile("" : : "g"(p) : "memory");
-}
-
-/// Taken fron Chandler Carruth's CppCon 2015 talk "Tuning C++: Benchmarks, and CPUs, and Compilers!
-/// Oh My!" This function is magic! It mimicks a write a global write, all the memory could have
-/// been written.
-static void clobber()
-{
-    asm volatile("" : : : "memory");
-}
-
-// Just some print functions, which make everything a little bit cleaner
-void print_header();
-void print_difference(float diff_total, float diff_alloc, float diff_free);
-void print_round(long N, fsec alloc_elapsed, fsec free_elapsed, fsec tbb_alloc_elapsed,
-                 fsec tbb_free_elapsed);
+// Some includes to just clean this file up a bit
+#include "print.h"
+#include "options.h"
+#include "types.h"
+#include "util.h"
 
 template <typename Malloc, typename Free>
-auto basic_alloc_free(long N, Malloc malloc, Free free) -> std::pair<fsec, fsec>
+auto basic_alloc_free_impl(long ipow, Malloc malloc, Free free) -> std::pair<fsec, fsec>
 {
+    long N = std::pow(2, ipow);
+
     fsec alloc_time{};
     fsec free_time{};
 
@@ -101,8 +57,10 @@ auto basic_alloc_free(long N, Malloc malloc, Free free) -> std::pair<fsec, fsec>
 }
 
 template <typename Malloc, typename Free>
-auto alloc_permuted_free(long N, Malloc malloc, Free free) -> std::pair<fsec, fsec>
+auto alloc_permuted_free_impl(long ipow, Malloc malloc, Free free) -> std::pair<fsec, fsec>
 {
+    long N = std::pow(2, ipow);
+
     std::vector<std::byte*> buffers;
     buffers.reserve(repeat);
 
@@ -129,8 +87,12 @@ auto alloc_permuted_free(long N, Malloc malloc, Free free) -> std::pair<fsec, fs
 }
 
 template <typename Malloc, typename Free>
-auto random_alloc_permuted_free(long lb, long ub, Malloc malloc, Free free) -> std::pair<fsec, fsec>
+auto random_alloc_permuted_free_impl(long ipow, Malloc malloc, Free free) -> std::pair<fsec, fsec>
 {
+    long N  = std::pow(2, ipow);
+    long lb = std::pow(2, ipow - 1);
+    long ub = std::pow(2, ipow + 1);
+
     std::vector<std::byte*> buffers;
     buffers.reserve(repeat);
 
@@ -170,12 +132,15 @@ auto random_alloc_permuted_free(long lb, long ub, Malloc malloc, Free free) -> s
 }
 
 template <typename Malloc, typename Free>
-auto random_alloc_random_permuted_free(long lb, long ub, Malloc malloc, Free free)
-    -> std::pair<fsec, fsec>
+auto random_alloc_random_permuted_free_impl(long ipow, Malloc malloc, Free free) -> std::pair<fsec, fsec>
 {
     std::random_device rd;
     std::mt19937       alloc_gen(rd());
     std::mt19937       free_gen(rd());
+
+    long N  = std::pow(2, ipow);
+    long lb = std::pow(2, ipow - 1);
+    long ub = std::pow(2, ipow + 1);
 
     std::vector<std::byte*> buffers;
     buffers.reserve(repeat);
@@ -185,7 +150,7 @@ auto random_alloc_random_permuted_free(long lb, long ub, Malloc malloc, Free fre
 
     for (int i = 0; i < repeat; ++i) {
         // Create random number of how many new allocations should be performed
-        std::uniform_int_distribution<> alloc_dist(200, 500);
+        std::uniform_int_distribution<> alloc_dist(min_num_random_allocs, max_num_random_allocs);
         auto                            num_allocs = alloc_dist(alloc_gen);
 
         // Grow buffers by it's current size + num_allocs
@@ -227,8 +192,7 @@ auto random_alloc_random_permuted_free(long lb, long ub, Malloc malloc, Free fre
         }
 
         // Shorten the vector by num_frees
-        std::vector<decltype(buffers)::value_type>(buffers.begin() + num_frees, buffers.end())
-            .swap(buffers);
+        std::vector<decltype(buffers)::value_type>(buffers.begin() + num_frees, buffers.end()).swap(buffers);
     }
 
     // Clean up, free all remaining chunks
@@ -242,130 +206,53 @@ auto random_alloc_random_permuted_free(long lb, long ub, Malloc malloc, Free fre
     return {alloc_elapsed, free_elapsed};
 }
 
-template <typename T>
-void print_numpy(const std::vector<T>& v)
-{
-    if (v.empty())
-        return;
-
-    fmt::print("[");
-    fmt::print("{}", v[0]);
-
-    if (v.size() == 1) {
-        fmt::print("]");
-        return;
-    }
-
-    for (int i = 1; i < v.size(); ++i) {
-        fmt::print(",{}", v[i]);
-    }
-    fmt::print("]");
-}
-
-struct Stats {
-    long num_bytes{};
-    fsec alloc_elapsed{};
-    fsec free_elapsed{};
-    fsec tbb_alloc_elapsed{};
-    fsec tbb_free_elasped{};
-};
-
-auto print_stats(const std::vector<Stats>& statistics)
-{
-    if (!print_statistics)
-        return;
-
-    std::vector<long> bytes;
-    bytes.reserve(statistics.size());
-
-    std::vector<double> avg_allocs;
-    avg_allocs.reserve(statistics.size());
-
-    std::vector<double> avg_frees;
-    avg_frees.reserve(statistics.size());
-
-    std::vector<double> tbb_avg_allocs;
-    tbb_avg_allocs.reserve(statistics.size());
-
-    std::vector<double> tbb_avg_frees;
-    tbb_avg_frees.reserve(statistics.size());
-
-    for (const auto s : statistics) {
-        bytes.emplace_back(s.num_bytes);
-        avg_allocs.emplace_back(s.alloc_elapsed.count());
-        avg_frees.emplace_back(s.free_elapsed.count());
-        tbb_avg_allocs.emplace_back(s.tbb_alloc_elapsed.count());
-        tbb_avg_frees.emplace_back(s.tbb_free_elasped.count());
-    }
-
-    fmt::print("bytes = np.array("); 
-    print_numpy(bytes); 
-    fmt::print(")\n"); 
-     
-    fmt::print("allocs = np.array("); 
-    print_numpy(avg_allocs); 
-    fmt::print(")\n"); 
-     
-    fmt::print("frees = np.array("); 
-    print_numpy(avg_frees); 
-    fmt::print(")\n"); 
-     
-    fmt::print("tbb_allocs = np.array("); 
-    print_numpy(tbb_avg_allocs); 
-    fmt::print(")\n"); 
-     
-    fmt::print("tbb_frees = np.array("); 
-    print_numpy(tbb_avg_frees); 
-    fmt::print(")\n"); 
-}
 
 /// Perform linearly growing allocations and directly free the allocated memory afterwards
 auto linear_growth_alloc()
 {
-    print_header();
+    print_header(print_total_time);
 
     std::vector<Stats> statistics;
     statistics.reserve(max_size_power);
 
     // Perform allocations from 1 byte to 1 GB
     for (long n = 1; n <= max_size_power; ++n) {
-        long N = std::pow(2, n);
-        auto [tbb_alloc_elapsed, tbb_free_elapsed] =
-            basic_alloc_free(N, scalable_malloc, scalable_free);
-        auto [alloc_elapsed, free_elapsed] = basic_alloc_free(N, std::malloc, std::free);
+        long N                                     = std::pow(2, n);
+        auto [tbb_alloc_elapsed, tbb_free_elapsed] = basic_alloc_free_impl(n, scalable_malloc, scalable_free);
+        auto [alloc_elapsed, free_elapsed]         = basic_alloc_free_impl(n, std::malloc, std::free);
 
-        print_round(N, alloc_elapsed, free_elapsed, tbb_alloc_elapsed, tbb_free_elapsed);
+        print_round(N, alloc_elapsed, free_elapsed, tbb_alloc_elapsed, tbb_free_elapsed, print_round_time, print_total_time);
 
         // Log this to create nice copyable and easyly plotable stuff
         Stats stats = {N, alloc_elapsed, free_elapsed, tbb_alloc_elapsed, tbb_free_elapsed};
         statistics.emplace_back(stats);
     }
 
-    print_stats(statistics);
+    return statistics;
 }
 
 /// Perform linearly growing allocations, but first perform many allocations and then free them
 /// afterwards in a permuted (i.e not the order of allocation)
 auto linear_growth_permuted_free()
 {
-    print_header();
+    print_header(print_total_time);
 
     std::vector<Stats> statistics;
     statistics.reserve(max_size_power);
 
     for (long n = 1; n <= max_size_power; ++n) {
-        long N                             = std::pow(2, n);
-        auto [alloc_elapsed, free_elapsed] = alloc_permuted_free(N, std::malloc, std::free);
-        auto [tbb_alloc_elapsed, tbb_free_elapsed] =
-            alloc_permuted_free(N, scalable_malloc, scalable_free);
+        long N                                     = std::pow(2, n);
+        auto [alloc_elapsed, free_elapsed]         = alloc_permuted_free_impl(n, std::malloc, std::free);
+        auto [tbb_alloc_elapsed, tbb_free_elapsed] = alloc_permuted_free_impl(n, scalable_malloc, scalable_free);
 
-        print_round(N, alloc_elapsed, free_elapsed, tbb_alloc_elapsed, tbb_free_elapsed);
+        print_round(N, alloc_elapsed, free_elapsed, tbb_alloc_elapsed, tbb_free_elapsed, print_round_time, print_total_time);
 
         // Log this to create nice copyable and easyly plotable stuff
         Stats stats = {N, alloc_elapsed, free_elapsed, tbb_alloc_elapsed, tbb_free_elapsed};
         statistics.emplace_back(stats);
     }
-    print_stats(statistics);
+
+    return statistics;
 }
 
 /// Allocate random sizes which varie to the next lower power of 2 and the next larger power of
@@ -373,7 +260,7 @@ auto linear_growth_permuted_free()
 /// everything and randomly free them
 auto random_alloc_permuted_free()
 {
-    print_header();
+    print_header(print_total_time);
 
     std::vector<Stats> statistics;
     statistics.reserve(max_size_power);
@@ -381,22 +268,19 @@ auto random_alloc_permuted_free()
     // Iterate over 2^1 to 2^20
     for (long n = 1; n <= max_size_power; ++n) {
         // Calculate lower and upper bound
-        auto N  = std::pow(2, n);
-        auto lb = std::pow(2, n - 1);
-        auto ub = std::pow(2, n + 1);
+        long N = std::pow(2, n);
 
-        auto [alloc_elapsed, free_elapsed] =
-            random_alloc_permuted_free(lb, ub, std::malloc, std::free);
-        auto [tbb_alloc_elapsed, tbb_free_elapsed] =
-            random_alloc_permuted_free(lb, ub, scalable_malloc, scalable_free);
+        auto [alloc_elapsed, free_elapsed]         = random_alloc_permuted_free_impl(n, std::malloc, std::free);
+        auto [tbb_alloc_elapsed, tbb_free_elapsed] = random_alloc_permuted_free_impl(n, scalable_malloc, scalable_free);
 
-        print_round(N, alloc_elapsed, free_elapsed, tbb_alloc_elapsed, tbb_free_elapsed);
+        print_round(N, alloc_elapsed, free_elapsed, tbb_alloc_elapsed, tbb_free_elapsed, print_round_time, print_total_time);
 
         // Log this to create nice copyable and easyly plotable stuff
         Stats stats = {N, alloc_elapsed, free_elapsed, tbb_alloc_elapsed, tbb_free_elapsed};
         statistics.emplace_back(stats);
     }
-    print_stats(statistics);
+
+    return statistics;
 }
 
 /// Similar to random_alloc_permuted_free(), but now don't free everything, free a random number
@@ -404,7 +288,7 @@ auto random_alloc_permuted_free()
 /// This should mimic a programm with many different allocations and common frees
 auto random_alloc_random_permuted_free()
 {
-    print_header();
+    print_header(print_total_time);
 
     std::vector<Stats> statistics;
     statistics.reserve(max_size_power);
@@ -412,27 +296,26 @@ auto random_alloc_random_permuted_free()
     // Iterate over 2^1 to 2^20
     for (long n = 1; n <= max_size_power; ++n) {
         // Calculate lower and upper bound
-        auto N  = std::pow(2, n);
-        auto lb = std::pow(2, n - 1);
-        auto ub = std::pow(2, n + 1);
+        long N = std::pow(2, n);
 
-        auto [alloc_elapsed, free_elapsed] =
-            random_alloc_random_permuted_free(lb, ub, std::malloc, std::free);
-        auto [tbb_alloc_elapsed, tbb_free_elapsed] =
-            random_alloc_random_permuted_free(lb, ub, scalable_malloc, scalable_free);
+        auto [alloc_elapsed, free_elapsed]         = random_alloc_random_permuted_free_impl(n, std::malloc, std::free);
+        auto [tbb_alloc_elapsed, tbb_free_elapsed] = random_alloc_random_permuted_free_impl(n, scalable_malloc, scalable_free);
 
-        print_round(N, alloc_elapsed, free_elapsed, tbb_alloc_elapsed, tbb_free_elapsed);
+        print_round(N, alloc_elapsed, free_elapsed, tbb_alloc_elapsed, tbb_free_elapsed, print_round_time, print_total_time);
 
         // Log this to create nice copyable and easyly plotable stuff
         Stats stats = {N, alloc_elapsed, free_elapsed, tbb_alloc_elapsed, tbb_free_elapsed};
         statistics.emplace_back(stats);
     }
-    print_stats(statistics);
+
+    return statistics;
 }
 
-auto threaded_linear_growth_alloc(int num_threads)
+using Callback = std::pair<fsec, fsec> (*)(long, void* (*) (std::size_t), void free(void*));
+
+auto threaded_alloc(int num_threads, Callback func)
 {
-    print_header();
+    print_header(print_total_time);
 
     std::vector<Stats> statistics;
     statistics.reserve(max_size_power);
@@ -443,16 +326,16 @@ auto threaded_linear_growth_alloc(int num_threads)
         std::vector<std::pair<fsec, fsec>> times(num_threads);
         std::mutex                         mtx;
 
-        auto N  = std::pow(2, n);
+        long N  = std::pow(2, n);
         auto lb = std::pow(2, n - 1);
         auto ub = std::pow(2, n + 1);
 
         for (int i = 0; i < num_threads; ++i) {
             // Create a thread
-            threads.emplace_back([&mtx, &times, i, thread_id = i, N, lb, ub]() {
+            threads.emplace_back([&func, &mtx, &times, i, thread_id = i, n]() {
                 // Save pair into tmp
                 // auto tmp = alloc_permuted_free(N, std::malloc, std::free);
-                auto tmp = random_alloc_random_permuted_free(lb, ub, std::malloc, std::free);
+                auto tmp = func(n, std::malloc, std::free);
 
                 // Lock and save pair into vector, just to be save
                 std::scoped_lock _(mtx);
@@ -484,10 +367,10 @@ auto threaded_linear_growth_alloc(int num_threads)
         times.resize(num_threads);
 
         for (int i = 0; i < num_threads; ++i) {
-            threads.emplace_back([&mtx, &times, i, thread_id = i, N, lb, ub]() {
+            threads.emplace_back([&func, &mtx, &times, i, thread_id = i, n]() {
                 // Save pair into tmp
                 // auto tmp = alloc_permuted_free(N, scalable_malloc, scalable_free);
-                auto tmp = random_alloc_random_permuted_free(lb, ub, std::malloc, std::free);
+                auto tmp = func(n, scalable_malloc, scalable_free);
 
                 // Lock and save pair into vector, just to be save
                 std::scoped_lock _(mtx);
@@ -511,39 +394,43 @@ auto threaded_linear_growth_alloc(int num_threads)
         tbb_alloc_elapsed /= num_threads;
         tbb_free_elapsed /= num_threads;
 
-        print_round(N, alloc_elapsed, free_elapsed, tbb_alloc_elapsed, tbb_free_elapsed);
+        print_round(N, alloc_elapsed, free_elapsed, tbb_alloc_elapsed, tbb_free_elapsed, print_round_time, print_total_time);
 
         // Log this to create nice copyable and easyly plotable stuff
         Stats stats = {N, alloc_elapsed, free_elapsed, tbb_alloc_elapsed, tbb_free_elapsed};
         statistics.emplace_back(stats);
     }
-    print_stats(statistics);
+
+    return statistics;
 }
+
+void loop_body() {}
 
 int main(int argc, char** argv)
 {
     cxxopts::Options options(argv[0], "Test defaul std::malloc vs TBB scalable malloc");
 
     options.add_options()("h,help", "Display Help message", cxxopts::value<bool>());
-    options.add_options()("v,verbose", "Verbose output (includes small explanation of each test)",
+    options.add_options()("v,verbose", "Verbose output (v: Round time output, vv: Round time with total time difference)",
                           cxxopts::value<bool>());
+    options.add_options()("q,quiet", "Don't print output each round, but only numpy output", cxxopts::value<bool>());
+    options.add_options()("r,report", "Report numpy arrays to further use in plotting", cxxopts::value<bool>());
 
-    options.add_options()("p,print-numpy", "Print as nparrays for python", cxxopts::value<bool>());
-    options.add_options()("P,print-total-time", "Print column with total time", cxxopts::value<bool>());
-     
-    options.add_options()("n,num-threads", "Number of threads",
-                          cxxopts::value<int>()->default_value("4"));
-     
-    options.add_options()("lin-growth-direct-free", "Linearly growing chunks, direct free",
+    options.add_options()("n,num-threads", "Number of threads", cxxopts::value<int>()->default_value("4"));
+
+    options.add_options()("m,min-allocs", "Minimum number of allocs done for random alloc tests",
+                          cxxopts::value<int>()->default_value("200"));
+    options.add_options()("M,max-allocs", "Maximum number of allocs done for random alloc tests",
+                          cxxopts::value<int>()->default_value("500"));
+
+    options.add_options()("a,all", "Run all tests", cxxopts::value<bool>()->default_value("true"));
+    options.add_options()("lin-growth-direct-free", "Linearly growing chunks, direct free", cxxopts::value<bool>());
+    options.add_options()("lin-growth-permuted-free", "Linearly growing chunks, delayed permuted free", cxxopts::value<bool>());
+    options.add_options()("random-alloc-permuted-free", "random sized chunks (in ranges), delayed permuted free", cxxopts::value<bool>());
+    options.add_options()("random-alloc-random-free", "random sized chunks (in ranges), random delayed permuted free",
                           cxxopts::value<bool>());
-    options.add_options()("lin-growth-permuted-free",
-                          "Linearly growing chunks, delayed permuted free", cxxopts::value<bool>());
-    options.add_options()("random-alloc-permuted-free",
-                          "random sized chunks (in ranges), delayed permuted free",
-                          cxxopts::value<bool>());
-    options.add_options()("random-alloc-random-free",
-                          "random sized chunks (in ranges), random delayed permuted free",
-                          cxxopts::value<bool>());
+    options.add_options()("threaded", "Run the specified tests threaded", cxxopts::value<bool>());
+    options.add_options()("scaling", "Run all tests from 1 to num-threads", cxxopts::value<bool>());
 
     auto result = options.parse(argc, argv);
 
@@ -552,144 +439,188 @@ int main(int argc, char** argv)
         exit(0);
     }
 
-    if (result.count("print-numpy")) {
-        print_statistics = true;
+    if (result.count("quiet") && result.count("verbose")) {
+        fmt::print("Specified both '-q/--quiet' and '-v/--verbose'\n");
     }
-     
-    if (result.count("print-total-time")) {
+
+    if (result.count("quiet") >= 1) {
+        print_round_time = false;
+    }
+
+    if (result.count("quiet") >= 2) {
+        print_round_time = false;
+    }
+
+    if (result.count("verbose") >= 1) {
+        print_round_time = true;
+    }
+
+    if (result.count("verbose") >= 2) {
         print_total_time = true;
     }
+    std::FILE* file_handle = nullptr; 
+    if (result["report"].as<bool>()) {
+        print_statistics = true;
+        file_handle      = std::fopen("report.py", "w");
+    } else {
+        print_statistics = false;
+    }
+
+    // Set some globals
+    min_num_random_allocs = result["min-allocs"].as<int>();
+    max_num_random_allocs = result["max-allocs"].as<int>();
+
+    const auto threaded = result.count("threaded");
+
+    // Get the number of threads
+    const auto num_threads = threaded ? result["num-threads"].as<int>() : 1;
+
+    if (threaded) {
+        fmt::print("Running tests using {} threads\n", num_threads);
+    }
+
+    const bool run_all = result["all"].as<bool>()
+                         && !(result["lin-growth-direct-free"].as<bool>() || result["lin-growth-permuted-free"].as<bool>()
+                              || result["random-alloc-permuted-free"].as<bool>() || result["random-alloc-random-free"].as<bool>());
+
+    const bool run_scaling = result["scaling"].as<bool>();
+
+    if (run_all) {
+        fmt::print("Running all tests");
+    }
+
+    if (run_scaling) {
+        fmt::print("Running scaling test from {} to {} threads\n", 1, num_threads);
+    }
+
+    std::vector<int> range_threads(num_threads);
+    std::iota(range_threads.begin(), range_threads.end(), 1);
 
     // threaded_linear_growth_alloc(3);
-    bool verbose = result.count("verbose");
+    const bool verbose = result["verbose"].as<bool>();
 
-    if (result.count("lin-growth-direct-free")) {
-        if (verbose) {
-            fmt::print("{:=^50}\n", "");
-            fmt::print("Allocate fixed size chunk and free chunk right away\n");
-            fmt::print(
-                "This is a rather syntethic benchmark. It's quite rare to just allocate and free "
-                "right away\n\n");
-            fmt::print("Compare speedup of TBB scalabe allocator vs libstdc++ malloc\n");
-            fmt::print("{:=^50}\n\n", "");
+    if (result["lin-growth-direct-free"].as<bool>() || run_all) {
+
+        fmt::print("{:=^50}\n", "");
+        fmt::print("Allocate a fixed size and release it directly. Allocations grow exponentionally\n\n");
+        fmt::print("Rather syntethic benchmark. No real(TM) application just allocates");
+        fmt::print("sizes in power of 2 and then releasaed them right away.\n\n");
+        fmt::print("{:=^50}\n\n", "");
+        if (threaded) {
+            if (run_scaling) {
+
+                std::vector<std::vector<Stats>> stats;
+                stats.reserve(num_threads);
+
+                for (int nthreads = 1; nthreads <= num_threads; ++nthreads) {
+                    auto tmp_stats = threaded_alloc(num_threads, basic_alloc_free_impl);
+                    stats.emplace_back(std::move(tmp_stats));
+                }
+
+                print_stats(file_handle, range_threads, stats);
+            } else {
+                auto stats = threaded_alloc(num_threads, basic_alloc_free_impl);
+                print_stats(file_handle, stats);
+            }
+        } else {
+            auto stats = linear_growth_alloc();
+            print_stats(file_handle, stats);
         }
-        linear_growth_alloc();
     }
 
-    if (result.count("lin-growth-permuted-free")) {
-        if (verbose) {
-            fmt::print("\n\n{:=^50}\n", "");
-            fmt::print(
-                "Allocate fixed size chunks and free them all in one go after all allocations\n\n");
-            fmt::print("Compare speedup of TBB scalabe allocator vs libstdc++malloc\n");
-            fmt::print("{:=^50}\n\n", "");
+    if (result["lin-growth-permuted-free"].as<bool>() || run_all) {
+        fmt::print("\n\n{:=^50}\n", "");
+        fmt::print("Allocate {} fixed size chunks, randomly shuffle them, ", repeat);
+        fmt::print(" and free them in the new order\n\n");
+
+        fmt::print("Closer to real behaviour, mimicks very easy programs, that just ");
+        fmt::print("allocate a bunch at the beginning and then free it at the end\n\n");
+        fmt::print("{:=^50}\n\n", "");
+
+        if (threaded) {
+            if (run_scaling) {
+                std::vector<std::vector<Stats>> stats;
+                stats.reserve(num_threads);
+
+                for (int nthreads = 1; nthreads <= num_threads; ++nthreads) {
+                    auto tmp_stats = threaded_alloc(num_threads, alloc_permuted_free_impl);
+                    stats.emplace_back(std::move(tmp_stats));
+                }
+                print_stats(file_handle, range_threads, stats);
+            } else {
+                auto stats = threaded_alloc(num_threads, alloc_permuted_free_impl);
+                print_stats(file_handle, stats);
+            }
+        } else {
+            auto stats = linear_growth_permuted_free();
+            print_stats(file_handle, stats);
         }
-        linear_growth_permuted_free();
     }
 
-    if (result.count("random-alloc-permuted-free")) {
-        if (verbose) {
-            fmt::print("\n\n{:=^50}\n", "");
-            fmt::print("Allocate random size chunks and free them all in one go after all "
-                       "allocations\n\n");
-            fmt::print("Compare speedup of TBB scalabe allocator vs libstdc++malloc\n");
-            fmt::print("{:=^50}\n\n", "");
+    if (result["random-alloc-permuted-free"].as<bool>() || run_all) {
+        fmt::print("\n\n{:=^50}\n", "");
+        fmt::print("Allocate {} random size chunks, randomly shuffle them, ", repeat);
+        fmt::print(" and free them in the new order\n\n");
+
+        fmt::print("Closer to real(TM) behaviour, mimicks very easy programs, that just ");
+        fmt::print("allocate a bunch at the beginning and then free it at the end\n\n");
+        fmt::print("{:=^50}\n\n", "");
+
+        if (threaded) {
+            if (run_scaling) {
+                std::vector<std::vector<Stats>> stats;
+                stats.reserve(num_threads);
+
+                for (int nthreads = 1; nthreads <= num_threads; ++nthreads) {
+                    auto tmp_stats = threaded_alloc(num_threads, random_alloc_permuted_free_impl);
+                    stats.emplace_back(std::move(tmp_stats));
+                }
+                print_stats(file_handle, range_threads, stats);
+            } else {
+                auto stats = threaded_alloc(num_threads, random_alloc_permuted_free_impl);
+                print_stats(file_handle, stats);
+            }
+        } else {
+            auto stats = random_alloc_permuted_free();
+            print_stats(file_handle, stats);
         }
-        random_alloc_permuted_free();
     }
 
-    if (result.count("random-alloc-random-free")) {
-        if (verbose) {
-            fmt::print("\n\n{:=^50}\n", "");
-            fmt::print("Allocate random size chunks and free small portion, then start allocation "
-                       "again\n\n");
-            fmt::print("Compare speedup of TBB scalabe allocator vs libstdc++ malloc\n");
-            fmt::print("{:=^50}\n\n", "");
+    if (result["random-alloc-random-free"].as<bool>() || run_all) {
+        fmt::print("\n\n{:=^50}\n", "");
+        fmt::print("Allocate a random number of randomly sized chunks (in range [{}, {}[)", min_num_random_allocs, max_num_random_allocs);
+        fmt::print(", free a random number and then repeat.\n\n");
+
+        fmt::print("Closest so far to real(TM) behaviour, mimicks more complex programs, that ");
+        fmt::print("allocate a bunch and then free a part of it and then allocate again and so on\n\n");
+        fmt::print("{:=^50}\n\n", "");
+
+        if (threaded) {
+            if (run_scaling) {
+
+                std::vector<std::vector<Stats>> stats;
+                stats.reserve(num_threads);
+
+                for (int nthreads = 1; nthreads <= num_threads; ++nthreads) {
+                    auto tmp_stats = threaded_alloc(num_threads, random_alloc_random_permuted_free_impl);
+                    stats.emplace_back(std::move(tmp_stats));
+                }
+
+                print_stats(file_handle, range_threads, stats);
+
+            } else {
+                auto stats = threaded_alloc(num_threads, random_alloc_random_permuted_free_impl);
+                print_stats(file_handle, stats);
+            }
+        } else {
+            auto stats = random_alloc_random_permuted_free();
+            print_stats(file_handle, stats);
         }
-        random_alloc_random_permuted_free();
+    }
+    if (result["report"].as<bool>() && file_handle) {
+        std::fclose(file_handle);
     }
 
     return 0;
 }
 
-void print_header()
-{
-    if (print_total_time) {
-        fmt::print("|{:-^12}|{:-^44}|{:-^44}|{:-^35}|\n", "", "libstdc++ malloc", "TBB malloc",
-                   "Difference");
-        fmt::print(
-            "|{:^12}| {:^12} | {:^12} | {:^12} | {:^12} | {:^12} | {:^12} || {:^9} | {:^9} | "
-            "{:^9} |\n",
-            "Bytes", "Total Time", "Alloc Time", "Free Time", "Total Time", "Alloc Time",
-            "Free Time", "Total", "Alloc", "Free");
-    } else {
-        fmt::print("|{:-^12}||{:-^29}||{:-^29}||{:-^23}||\n", "", "libstdc++ malloc", "TBB malloc",
-                   "Difference");
-        fmt::print("|{:^12}|| {:^12} | {:^12} || {:^12} | {:^12} || {:^9} | {:^9} ||\n", "Bytes",
-                   "Alloc Time", "Free Time", "Alloc Time", "Free Time", "Alloc", "Free");
-    }
-}
-
-void print_round(long N, fsec alloc_elapsed, fsec free_elapsed, fsec tbb_alloc_elapsed,
-                 fsec tbb_free_elapsed)
-{
-    float avg_alloc = alloc_elapsed.count() / repeat;
-    float avg_free  = free_elapsed.count() / repeat;
-    float avg_total = avg_alloc + avg_free;
-
-    float tbb_avg_alloc = tbb_alloc_elapsed.count() / repeat;
-    float tbb_avg_free  = tbb_free_elapsed.count() / repeat;
-    float tbb_avg_total = tbb_avg_alloc + tbb_avg_free;
-
-    float diff_alloc = ((avg_alloc / tbb_avg_alloc) - 1) * 100;
-    float diff_free  = ((avg_free / tbb_avg_free) - 1) * 100;
-    float diff_total = ((avg_total / tbb_avg_total) - 1) * 100;
-
-    if (print_total_time) {
-        fmt::print("| {:>10} || {:>12.10f} | {:>12.10f} | {:>12.10f} || {:>12.10f} | {:>12.10f} | "
-                   "{:>12.10f} |",
-                   N, avg_total, avg_alloc, avg_free, tbb_avg_total, tbb_avg_alloc, tbb_avg_free);
-    } else {
-        fmt::print("| {:>10} || {:>12.10f} | {:>12.10f} || {:>12.10f} | "
-                   "{:>12.10f} ||",
-                   N, avg_alloc, avg_free, tbb_avg_alloc, tbb_avg_free);
-    }
-
-    print_difference(diff_total, diff_alloc, diff_free);
-}
-
-void print_difference(float diff_total, float diff_alloc, float diff_free)
-{
-    auto diff_total_color = [&] {
-        if (diff_total < 0.0) {
-            return fmt::color::red;
-        }
-        return fmt::color::green;
-    }();
-
-    if (print_total_time) {
-        fmt::print(fmt::fg(diff_total_color), " {:>+8.2f}% ", diff_total);
-        fmt::print("|");
-    }
-
-    auto diff_alloc_color = [&] {
-        if (diff_alloc < 0.0) {
-            return fmt::color::red;
-        }
-        return fmt::color::green;
-    }();
-
-    fmt::print(fmt::fg(diff_alloc_color), " {:>+8.2f}% ", diff_alloc);
-    fmt::print("|");
-
-    auto diff_free_color = [&] {
-        if (diff_free < 0.0) {
-            return fmt::color::red;
-        }
-        return fmt::color::green;
-    }();
-
-    fmt::print(fmt::fg(diff_free_color), " {:>+8.2f}% ", diff_free);
-    fmt::print("||");
-    fmt::print("\n");
-}

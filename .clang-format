@@ -21,7 +21,7 @@ BreakBeforeBinaryOperators: NonAssignment
 BreakBeforeBraces: Linux
 BreakBeforeTernaryOperators: 'true'
 BreakConstructorInitializers: BeforeColon
-ColumnLimit: '100'
+ColumnLimit: '140'
 CompactNamespaces: 'true'
 ConstructorInitializerAllOnOneLineOrOnePerLine: 'true'
 Cpp11BracedListStyle: 'true'
